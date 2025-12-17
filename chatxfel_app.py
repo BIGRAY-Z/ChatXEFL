@@ -11,6 +11,7 @@ from streamlit import session_state as ss
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 import os
 import ui_utils  # <--- 【新增 1】引入打字机
+import chat_manager # 【新增】引入新的对话管理器
 current_dir = os.path.dirname(os.path.abspath(__file__))
 # 将其加入到系统路径中
 sys.path.append(current_dir)
@@ -46,6 +47,35 @@ def reset_retriever_cache():
 
 with st.sidebar:
     st.title('ChatXFEL Beta 1.0')
+    
+    # --- 【新增/修改】多对话管理区域 Start ---
+    # 1. 初始化 Session
+    chat_manager.init_session()
+    
+    # 2. 新建对话按钮
+    if st.button('➕ New Chat', use_container_width=True):
+        chat_manager.create_new_chat()
+        st.rerun() # 强制刷新页面以更新右侧聊天区
+
+    # 3. 历史对话列表 (使用 Expander 折叠)
+    with st.expander("🕒 Chat History", expanded=True):
+        if not st.session_state.chat_history:
+            st.write("No history yet.")
+        else:
+            for chat in st.session_state.chat_history:
+                # 给当前选中的对话加个视觉标记
+                label = chat['title']
+                if chat['id'] == st.session_state.current_chat_id:
+                    label = f"🟢 {label}"
+                
+                # 点击历史记录切换
+                if st.button(label, key=f"hist_{chat['id']}", use_container_width=True):
+                    chat_manager.switch_chat(chat['id'])
+                    st.rerun()
+    
+    st.divider() # 加个分割线美观一点
+    # --- 【新增/修改】多对话管理区域 End ---
+    
     #st.markdown('[About ChatXFEL](https://confluence.cts.shanghaitech.edu.cn/pages/viewpage.action?pageId=129762874)')
     st.markdown('[ChatXFEL简介与提问技巧](https://confluence.cts.shanghaitech.edu.cn/pages/viewpage.action?pageId=129762874)')
     #st.write(':red[You have agreed the recording of your IP and access time.]')
@@ -285,7 +315,8 @@ retriever = get_retriever_runtime(retriever_obj, compressor, filters=filters)
 initial_message = {"role": "assistant", "content": "What do you want to know about XFEL?"}
 # Store LLM generated responses
 if "messages" not in ss.keys():
-    ss.messages = [initial_message]
+    # ss.messages = [initial_message]
+    chat_manager.create_new_chat(reset_ui=True)
 
 def log_feedback(feedback:dict, use_mongo):
     if feedback.get('Feedback', '') == '':
@@ -367,6 +398,9 @@ if question:= st.chat_input():
     if enable_log:
         question_time = time.strftime('%Y-%m-%d %H:%M:%S')
     ss.messages.append({"role": "user", "content": question})
+    # 【新增】关键点：用户输入完问题后，立即保存状态
+    # 这样 chat_manager 就能把 "New Chat" 的标题改成这个问题的内容
+    chat_manager.save_current_chat()
     with st.chat_message("user"):
         st.write(question)
 
@@ -459,6 +493,9 @@ if ss.messages[-1]["role"] != "assistant":
         logs = {'IP':client_ip, 'Time':question_time, 'Model':selected_model, 'Question': question, 'Answer':full_response, 'Source':source}
         utils.log_rag(logs, use_mongo=use_mongo)
     ss.messages.append(message)
+    # 【新增】关键点：AI 回答完毕后，再次保存状态
+    # 确保刚才生成的回答被存入 chat_history 列表
+    chat_manager.save_current_chat()
     st.rerun()
 #c = st.columns([8,2.5])
 #feedback = st.feedback('stars', key='feedback')
