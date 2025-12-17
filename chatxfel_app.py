@@ -129,6 +129,11 @@ with st.sidebar:
     if expr_parts:
         filters['expr'] = " and ".join(expr_parts)
 
+    enable_abstract_routing = st.sidebar.checkbox(
+    'Enable Abstract Routing', 
+    value=False, 
+    help="First search abstracts to find relevant papers, then retrieve detailed content."
+)
     n_batch, n_ctx, max_tokens = 512, 8192, 8192 
     #return_source = st.sidebar.checkbox('Return Source', key='source', value=True)
     return_source = True
@@ -251,15 +256,22 @@ def get_hybrid_retriever_obj(connection_args, col_name):
     # 调用我们在 rag.py 中新写的函数
     return rag.get_hybrid_retriever(connection_args, col_name, top_k=10)
 
+@st.cache_resource
+def get_routing_retriever_obj(connection_args, col_name):
+    # 调用 rag.py 中新写的工厂函数
+    return rag.get_routing_retriever(connection_args, col_name, top_k=10)
+
 # 实例化
-if selected_em == 'BGE-M3': # 只有 BGE-M3 支持混合检索
-    retriever_obj = get_hybrid_retriever_obj(connection_args, selected_col)
-    # 注意：因为 MilvusHybridRetriever 已经是 Retriever 类型，
-    # 如果你还需要 ContextualCompressionRetriever (Rerank)，
-    # 可以直接传给它：
-    # retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever_obj)
+if selected_em == 'BGE-M3': 
+    if enable_abstract_routing:
+        # 使用新的路由检索器
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}: Using Abstract Routing Retriever...")
+        retriever_obj = get_routing_retriever_obj(connection_args, selected_col)
+    else:
+        # 使用原有的混合检索器
+        retriever_obj = get_hybrid_retriever_obj(connection_args, selected_col)
 else:
-    # 其它模型继续使用旧逻辑
+    # 其它模型(Llama等)继续使用旧逻辑
     retriever_obj = get_retriever(connection_args, selected_col, embedding)
 #retriever_obj = get_retriever(connection_args, selected_col, embedding)
 compressor = get_rerank_model(top_n=n_recall)

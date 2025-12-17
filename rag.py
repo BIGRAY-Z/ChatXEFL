@@ -424,3 +424,165 @@ def retrieve_generate(question, llm, prompt, retriever, history=None, return_sou
     else:
         answer = rag_chain.invoke(question)
         return answer
+
+
+class MilvusRoutingRetriever(BaseRetriever):
+    """
+    路由检索器：
+    1. 先在 abstract_collection (摘要库) 中进行混合检索，找出最相关的文献 DOI。
+    2. 使用这些 DOI 作为过滤条件，在 fulltext_collection (全文库) 中进行第二次混合检索。
+    """
+    abstract_collection: str = "xfel_abstracts_v1" # 固定的摘要库名称
+    fulltext_collection: str # 动态传入的全文库名称
+    connection_args: dict
+    embedding_function: Any
+    top_k_abstracts: int = 5   # 第一步：检索多少篇最相关的摘要
+    top_k_fulltext: int = 10   # 第二步：最终返回多少个全文切片
+    current_filter: str = ""   # 外部传入的年份/关键词过滤
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> List[Document]:
+        
+        # 0. 确保连接
+        try:
+            connections.connect(alias="default", **self.connection_args)
+        except Exception:
+            pass
+
+        # -------------------------------------------------------
+        # 第一步：对 Query 编码 (Dense + Sparse)
+        # -------------------------------------------------------
+        query_embeddings = self.embedding_function.encode_queries([query])
+        dense_vec = query_embeddings['dense'][0].tolist()
+        
+        # 处理 Sparse 向量
+        raw_sparse = query_embeddings['sparse']
+        if hasattr(raw_sparse, 'tocsr'):
+            sparse_matrix = raw_sparse.tocsr()
+        else:
+            sparse_matrix = raw_sparse
+        sparse_row = sparse_matrix[0]
+        # 确保 CSR 格式
+        try:
+            if not hasattr(sparse_row, "indices") and hasattr(sparse_row, "tocsr"):
+                sparse_row = sparse_row.tocsr()
+        except Exception:
+            pass
+        sparse_vec = {int(k): float(v) for k, v in zip(sparse_row.indices, sparse_row.data)}
+
+        # -------------------------------------------------------
+        # 第二步：检索摘要库 (xfel_abstracts_v1)
+        # -------------------------------------------------------
+        # 准备摘要库的搜索请求
+        # 注意：这里也应该应用外部传入的 current_filter (比如年份过滤)，以确保找出的摘要符合年份要求
+        abstract_expr = self.current_filter if self.current_filter else ""
+
+        abs_dense_req = AnnSearchRequest(
+            data=[dense_vec], anns_field="dense_vector",
+            param={"metric_type": "IP", "params": {"ef": 64}},
+            limit=self.top_k_abstracts, expr=abstract_expr
+        )
+        abs_sparse_req = AnnSearchRequest(
+            data=[sparse_vec], anns_field="sparse_vector",
+            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}}, 
+            limit=self.top_k_abstracts, expr=abstract_expr
+        )
+        
+        rerank = RRFRanker(k=60)
+        
+        try:
+            abs_col = Collection(self.abstract_collection)
+            abs_res = abs_col.hybrid_search(
+                [abs_dense_req, abs_sparse_req], rerank=rerank, limit=self.top_k_abstracts,
+                output_fields=["doi"] # 只需要 DOI
+            )
+        except Exception as e:
+            print(f"Abstract search failed: {e}")
+            return []
+
+        # 提取相关文献的 DOI
+        target_dois = []
+        for hits in abs_res:
+            for hit in hits:
+                doi = hit.entity.get("doi")
+                if doi and doi not in target_dois:
+                    target_dois.append(doi)
+        
+        if not target_dois:
+            print("No relevant abstracts found.")
+            return []
+
+        # -------------------------------------------------------
+        # 第三步：构建全文库的过滤条件 (DOI Routing)
+        # -------------------------------------------------------
+        # 格式: doi in ["10.111", "10.222"]
+        formatted_dois = [f'"{d}"' for d in target_dois]
+        doi_filter = f'doi in [{", ".join(formatted_dois)}]'
+        
+        # 合并外部过滤器 (年份等) 和 DOI 过滤器
+        if self.current_filter:
+            final_expr = f"({self.current_filter}) and ({doi_filter})"
+        else:
+            final_expr = doi_filter
+
+        # -------------------------------------------------------
+        # 第四步：检索全文库 (Target Collection)
+        # -------------------------------------------------------
+        full_dense_req = AnnSearchRequest(
+            data=[dense_vec], anns_field="dense_vector",
+            param={"metric_type": "IP", "params": {"ef": 64}},
+            limit=self.top_k_fulltext, expr=final_expr
+        )
+        full_sparse_req = AnnSearchRequest(
+            data=[sparse_vec], anns_field="sparse_vector",
+            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}}, 
+            limit=self.top_k_fulltext, expr=final_expr
+        )
+
+        try:
+            full_col = Collection(self.fulltext_collection)
+            full_res = full_col.hybrid_search(
+                [full_dense_req, full_sparse_req], rerank=rerank, limit=self.top_k_fulltext,
+                output_fields=["text", "title", "doi", "journal", "year", "page"]
+            )
+        except Exception as e:
+            print(f"Fulltext search failed: {e}")
+            return []
+
+        # 转换结果为 Document 对象
+        documents = []
+        for hits in full_res:
+            for hit in hits:
+                metadata = {
+                    "title": hit.entity.get("title"),
+                    "doi": hit.entity.get("doi"),
+                    "journal": hit.entity.get("journal"),
+                    "year": hit.entity.get("year"),
+                    "page": hit.entity.get("page"),
+                    "score": hit.score,
+                    "source_collection": self.fulltext_collection
+                }
+                documents.append(Document(page_content=hit.entity.get("text"), metadata=metadata))
+
+        return documents
+
+def get_routing_retriever(connection_args, fulltext_col_name, top_k=10):
+    """
+    工厂函数：获取路由检索器
+    """
+    # 初始化 embedding (与 get_hybrid_retriever 保持一致)
+    embedding = BGEM3EmbeddingFunction(
+        model_name = 'BAAI/bge-m3', 
+        device='cuda', 
+        use_fp16=True
+    )
+    
+    retriever = MilvusRoutingRetriever(
+        abstract_collection="xfel_abstracts_v1", # 硬编码摘要库
+        fulltext_collection=fulltext_col_name,   # 动态全文库
+        connection_args=connection_args,
+        embedding_function=embedding,
+        top_k_fulltext=top_k
+    )
+    return retriever
