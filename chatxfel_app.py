@@ -10,6 +10,7 @@ from langchain_community.chat_models import ChatOllama
 from streamlit import session_state as ss
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 import os
+import ui_utils  # <--- 【新增 1】引入打字机
 current_dir = os.path.dirname(os.path.abspath(__file__))
 # 将其加入到系统路径中
 sys.path.append(current_dir)
@@ -401,9 +402,17 @@ if ss.messages[-1]["role"] != "assistant":
             full_response = ''
             source = ''
             if return_source:
-                full_response += response['answer']
-                placeholder.markdown(full_response)
-                #full_response += '\nContext: \n'
+                # 1. 获取纯文本回答
+                answer_text = response['answer']
+                
+                # 2. 使用新工具进行打字机效果输出
+                # 注意：这里只对 answer_text 进行流式输出
+                ui_utils.stream_output(placeholder, answer_text)
+                
+                full_response += answer_text
+                # full_response += response['answer']
+                # placeholder.markdown(full_response)
+                # #full_response += '\nContext: \n'
                 for i, c in enumerate(response['context']):
                     source += f'{c.page_content}'
                     title = c.metadata.get('title') if 'title' in c.metadata.keys() else c.metadata.get('source')
