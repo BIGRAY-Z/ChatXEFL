@@ -325,6 +325,15 @@ if filter_year:
 retriever = get_retriever_runtime(retriever_obj, compressor, filters=filters)
 
 initial_message = {"role": "assistant", "content": "What do you want to know about XFEL?"}
+st.divider()
+st.subheader("Response Strategy")
+# 使用 Select Slider 模拟从严谨到创意的滑动感
+response_mode = st.select_slider(
+    'Choose your mode:',
+    options=['Strict (Rigorous)', 'Balanced', 'Creative (Flexible)'],
+    value='Balanced',
+    help="Strict: Only answers from papers. Creative: Uses AI knowledge if papers lack info."
+)
 # Store LLM generated responses
 if "messages" not in ss.keys():
     # ss.messages = [initial_message]
@@ -424,97 +433,111 @@ if 'feedback_bad' not in ss:
 
 if ss.messages[-1]["role"] != "assistant":
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+        placeholder = st.empty()
+        full_response = ''
+        source = ''
+        source_docs = [] # 存储最终用于生成和显示的文档
+        
+        with st.status("Thinking...", expanded=(response_mode == 'Strict')) as status:
+            # 1. 初始 Query 改写
             rewritten_question = rag.rewrite_query(question, llm)
-            #print(f"Original: {question} -> Rewritten: {rewritten_question}")
-            # response = rag.retrieve_generate(
-            #     question=rewritten_question, 
-            #     llm=llm, 
-            #     prompt=prompt,
-            #     retriever=retriever,
-            #     return_source=return_source
-            # )
             p = ' Please answer the question as detailed as possible and make up you answer in markdown format.'
             final_question = f"{rewritten_question}{p}"
-            response = rag.retrieve_generate(
-                question=final_question, 
-                llm=llm, 
-                prompt=prompt,
-                retriever=retriever, 
-                return_source=return_source
-            )
-            #response = generate_llama2_response(question)
-            placeholder = st.empty()
-            full_response = ''
-            source = ''
-            if return_source:
-                # 1. 获取纯文本回答
-                answer_text = response['answer']
-                
-                # 2. 使用新工具进行打字机效果输出
-                # 注意：这里只对 answer_text 进行流式输出
-                ui_utils.stream_output(placeholder, answer_text)
-                
-                full_response += answer_text
-                # full_response += response['answer']
-                # placeholder.markdown(full_response)
-                # #full_response += '\nContext: \n'
-                for i, c in enumerate(response['context']):
-                    source += f'{c.page_content}'
-                    title = c.metadata.get('title') if 'title' in c.metadata.keys() else c.metadata.get('source')
-                    doi = c.metadata.get('doi', '')
-                    journal = c.metadata.get('journal', '')
-                    year = c.metadata.get('year', '')
-                    page = c.metadata.get('page')
-                    if doi == '':
-                        source += f'\n\n**Ref. {i+1}**: {title}, {journal}, {year}, page {page}'
+            
+            # --- 核心逻辑开始 ---
+            if response_mode == 'Strict':
+                max_retries = 2
+                current_q = final_question
+                for i in range(max_retries + 1):
+                    status.write(f"🔍 Retrieval Attempt {i+1}...")
+                    # 执行检索
+                    res_raw = retriever.invoke(current_q)
+                    # 验证相关性
+                    rel = rag.grade_relevance(question, res_raw, llm)
+                    if rel == 'yes':
+                        source_docs = res_raw
+                        status.write("✅ Relevant evidence found.")
+                        break
+                    elif i < max_retries:
+                        status.write("⚠️ Low relevance. Rewriting query...")
+                        current_q = rag.rewrite_query(f"Focus on factual details of: {question}", llm) + p
                     else:
-                        source += f'\n\n**Ref. {i+1}**: {title}, {journal}, {year}, [{doi}](http://dx.doi.org/{doi}), page {page}'
-                    if i != len(response['context'])-1:
-                        source += '\n\n'
-                    #placeholder.markdown(source)
-                    if i == len(response['context'])-1:
-                        c = st.columns([8,3])
-                        with c[0].popover('Source'):
-                            st.markdown(source)
-                        #with c[1]:
-                        #    feedback = st.feedback('stars', key='feedback')
-                        #    if feedback is not None:
-                        #        log_feedback({'Feedback':str(feedback+1)}, use_mongo=use_mongo)
-                        #with c[1]:
-                        #    good = st.button(':thumbsup:', key='feedback_good', on_click=log_feedback, args=({'Feedback':'Good'},use_mongo,))
-                        #with c[2]:
-                        #    bad = st.button(':thumbsdown:', key='feedback_bad', on_click=log_feedback, args=({'Feedback':'Bad'}, use_mongo,))
-            else:
-                full_response = response.content
-                #for item in response:
-                #    full_response += item
-                #    placeholder.markdown(full_response)
-                placeholder.markdown(full_response)
-            #placeholder.markdown(full_response)
+                        source_docs = res_raw # 尽力而为
+                
+                # 生成回答
+                status.write("✍️ Generating response...")
+                response_data = rag.retrieve_generate(final_question, llm, prompt, retriever, return_source=True)
+                
+                # 验证幻觉
+                status.write("🛡️ Checking for hallucinations...")
+                hal = rag.grade_hallucination(response_data['answer'], source_docs, llm)
+                if hal == 'no':
+                    full_response = "⚠️ [Self-Correction] Based on the references, I cannot fully confirm the previous thought. " + response_data['answer']
+                else:
+                    full_response = response_data['answer']
+                source_docs = response_data['context']
 
+            elif response_mode == 'Creative':
+                # 先尝试 RAG
+                response_data = rag.retrieve_generate(final_question, llm, prompt, retriever, return_source=True)
+                # 验证是否有用
+                util = rag.grade_utility(response_data['answer'], llm)
+                if util == 'no':
+                    status.write("💡 No info in papers. Switching to internal knowledge...")
+                    # 只有创意模式允许“脑补”
+                    fallback_prompt = f"The following question cannot be answered by specific XFEL papers. Please answer using your internal scientific knowledge: {question}"
+                    fallback_res = llm.invoke(fallback_prompt)
+                    full_response = "💡 **Note: Based on internal AI knowledge (not found in current papers):**\n\n" + fallback_res.content
+                    source_docs = []
+                else:
+                    full_response = response_data['answer']
+                    source_docs = response_data['context']
+            
+            else: # Balanced (原有逻辑)
+                response_data = rag.retrieve_generate(final_question, llm, prompt, retriever, return_source=True)
+                full_response = response_data['answer']
+                source_docs = response_data['context']
+            
+            status.update(label="Response Generated!", state="complete", expanded=False)
+            # --- 核心逻辑结束 ---
+
+        # 2. 打字机流式输出 (保留原功能)
+        ui_utils.stream_output(placeholder, full_response)
+
+        # 3. 处理和格式化 Source (保留原功能且优化逻辑)
+        if return_source and source_docs:
+            for i, c in enumerate(source_docs):
+                source += f'{c.page_content}'
+                title = c.metadata.get('title', c.metadata.get('source', 'Unknown Title'))
+                doi = c.metadata.get('doi', '')
+                journal = c.metadata.get('journal', '')
+                year = c.metadata.get('year', '')
+                page = c.metadata.get('page', '')
+                
+                if doi == '':
+                    source += f'\n\n**Ref. {i+1}**: {title}, {journal}, {year}, page {page}'
+                else:
+                    source += f'\n\n**Ref. {i+1}**: {title}, {journal}, {year}, [{doi}](http://dx.doi.org/{doi}), page {page}'
+                
+                if i != len(source_docs)-1:
+                    source += '\n\n'
+            
+            # 显示 Source 弹出框
+            cols = st.columns([8,3])
+            with cols[0].popover('Source'):
+                st.markdown(source)
+
+    # 4. 保存状态与日志 (保留原功能)
     if return_source:
-        message = {"role": "assistant", "content": full_response, "source":source}
-        #if enable_log:
-            #utils.log_rag(client_ip, question_time, question, full_response, source, use_mongo=False)
+        message = {"role": "assistant", "content": full_response, "source": source}
     else:
         message = {"role": "assistant", "content": full_response}
-        #if enable_log:
-        #    utils.log_rag(client_ip, question_time, question, full_response, use_mongo=False)
+        
     if enable_log:
-        logs = {'IP':client_ip, 'Time':question_time, 'Model':selected_model, 'Question': question, 'Answer':full_response, 'Source':source}
+        logs = {'IP': client_ip, 'Time': question_time, 'Model': selected_model, 
+                'Mode': response_mode, 'Question': question, 'Answer': full_response, 'Source': source}
         utils.log_rag(logs, use_mongo=use_mongo)
+    
     ss.messages.append(message)
-    # 【新增】关键点：AI 回答完毕后，再次保存状态
-    # 确保刚才生成的回答被存入 chat_history 列表
     chat_manager.save_current_chat()
     st.rerun()
-#c = st.columns([8,2.5])
-#feedback = st.feedback('stars', key='feedback')
-#with c[0]:
-#    pass
-#with c[1]:
-#    if feedback is not None:
-#        log_feedback({'Feedback':str(feedback+1)}, use_mongo=use_mongo)
-    #history.append({'role':'user','content':question})
-    #history.append({'role':'assistant', 'content':full_response})

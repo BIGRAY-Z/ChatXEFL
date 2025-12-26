@@ -586,3 +586,39 @@ def get_routing_retriever(connection_args, fulltext_col_name, top_k=10):
         top_k_fulltext=top_k
     )
     return retriever
+
+def grade_relevance(question, docs, llm):
+    """验证检索文档的相关性"""
+    prompt = ChatPromptTemplate.from_template("""
+    Assessment: Is the following context relevant to the user's question? 
+    Context: {context}
+    Question: {question}
+    Answer only 'yes' or 'no'.
+    """)
+    chain = prompt | llm | StrOutputParser()
+    context_str = "\n\n".join([d.page_content for d in docs])
+    return chain.invoke({"question": question, "context": context_str}).strip().lower()
+
+def grade_hallucination(answer, docs, llm):
+    """验证是否存在幻觉（是否基于文档回答）"""
+    prompt = ChatPromptTemplate.from_template("""
+    Is the following answer supported BY the provided context?
+    Context: {context}
+    Answer: {answer}
+    Answer only 'yes' or 'no'.
+    """)
+    chain = prompt | llm | StrOutputParser()
+    context_str = "\n\n".join([d.page_content for d in docs])
+    return chain.invoke({"answer": answer, "context": context_str}).strip().lower()
+
+def grade_utility(question, answer, llm):
+    """验证回答是否有用（是否解决了问题而非回避）"""
+    prompt = ChatPromptTemplate.from_template("""
+    Does the following answer resolve the user's question effectively? 
+    If the answer says 'I don't know' or similar, answer 'no'. 
+    Otherwise, answer 'yes'.
+    Question: {question}
+    Answer: {answer}
+    """)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"question": question, "answer": answer}).strip().lower()
