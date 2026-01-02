@@ -53,8 +53,14 @@ with st.sidebar:
     chat_manager.init_session()
     
     # 2. 新建对话按钮
+    if 'rewrite_stage' not in ss:
+        ss.rewrite_stage = False      # 标识当前是否处于“等待用户确认Query”的状态
+    if 'temp_query' not in ss:
+        ss.temp_query = ""            # 存储中间生成的重写结果
     if st.button('➕ New Chat', use_container_width=True):
         chat_manager.create_new_chat()
+        ss.rewrite_stage = False
+        ss.temp_query = ""
         st.rerun() # 强制刷新页面以更新右侧聊天区
 
     # 3. 历史对话列表 (使用 Expander 折叠)
@@ -381,6 +387,8 @@ for message in ss.messages:
 def clear_chat_history():
     #ss.messages = [{"role": "assistant", "content": "How may I assist you today?"}]
     ss.messages = [initial_message]
+    ss.rewrite_stage = False
+    ss.temp_query = ""
 
 st.sidebar.button('Clear Chat History', on_click=clear_chat_history)
 
@@ -419,18 +427,52 @@ if question:= st.chat_input():
     if enable_log:
         question_time = time.strftime('%Y-%m-%d %H:%M:%S')
     ss.messages.append({"role": "user", "content": question})
+    with st.spinner("Optimizing your query for XFEL database..."):
+        ss.temp_query = rag.rewrite_query(question, llm) # 获取第一次自动重写结果
+        ss.rewrite_stage = True
     # 【新增】关键点：用户输入完问题后，立即保存状态
     # 这样 chat_manager 就能把 "New Chat" 的标题改成这个问题的内容
     chat_manager.save_current_chat()
     with st.chat_message("user"):
         st.write(question)
-
+    st.rerun()
 # Generate a new response if last message is not from assistant
 if 'feedback_good' not in ss:
     ss['feedback_good'] = None
 if 'feedback_bad' not in ss:
     ss['feedback_bad'] = None
-
+if ss.rewrite_stage:
+    with st.chat_message("assistant", avatar="🔍"):
+        st.info("I have rewritten your query to improve search results. You can refine it further:")
+        
+        # 1. 显示并允许手动修改生成的 Query
+        ss.temp_query = st.text_area(
+            "Refined Search Query (Full View):", 
+            value=ss.temp_query,
+            height=120,  # 设置足够的高度以直接看到完整改写
+            help="You can manually edit this text to precisely match your needs."
+        )
+        
+        # 2. 接收用户反馈意见
+        user_feedback = st.text_input("Provide feedback to AI for better rewriting (optional):", 
+                                      placeholder="e.g. 'Focus on the detector part', 'Expand abbreviations'")
+        
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("✅ Confirm & Search", type="primary"):
+                ss.rewrite_stage = False # 关闭重写阶段，进入真正的 RAG
+                st.rerun()
+        with col2:
+            if st.button("🔄 Refine with AI"):
+                if user_feedback:
+                    with st.spinner("Refining..."):
+                        ss.temp_query = rag.rewrite_query_with_feedback(
+                            ss.messages[-1]["content"], ss.temp_query, user_feedback, llm
+                        )
+                    st.rerun()
+                else:
+                    st.warning("Please enter feedback first.")
+    st.stop()
 if ss.messages[-1]["role"] != "assistant":
     with st.chat_message("assistant"):
         placeholder = st.empty()

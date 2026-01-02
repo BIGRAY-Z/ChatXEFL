@@ -312,7 +312,7 @@ def rewrite_query(question, llm):
     Rewrite the user question to be more suitable for retrieval.
     """
     # 定义重写提示词
-    template = """You are an AI assistant for a specialized scientific facility (XFEL). 
+    template = """You are an AI assistant for X-ray Free Electron Laser Facility(XFEL). 
     Your task is to rephrase the user's question to make it more precise and suitable for retrieving technical documents.
     
     Rules:
@@ -332,6 +332,33 @@ def rewrite_query(question, llm):
     # 执行重写
     rewritten_query = rewrite_chain.invoke({"question": question})
     return rewritten_query.strip()
+
+# 在 rag.py 中修改或添加
+def rewrite_query_with_feedback(original_question, current_rewrite, feedback, llm):
+    """
+    根据用户反馈进一步优化重写的问题
+    """
+    template = """You are an AI assistant helping a researcher refine their search query for X-ray Free Electron Laser Facility(XFEL).
+    
+    Original User Intent: {original_question}
+    Current Rewritten Version: {current_rewrite}
+    User Feedback: {feedback}
+    
+    Task: Based on the feedback, provide an improved version of the rewritten query. 
+    Focus on technical precision, XFEL terminology, and clarity.
+    Return ONLY the new rewritten question.
+
+    New Rewritten Question:"""
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+    
+    new_rewrite = chain.invoke({
+        "original_question": original_question,
+        "current_rewrite": current_rewrite,
+        "feedback": feedback
+    })
+    return new_rewrite.strip()
 
 def get_prompt(prompt='', return_format=True):
     if prompt == '':
@@ -622,3 +649,29 @@ def grade_utility(question, answer, llm):
     """)
     chain = prompt | llm | StrOutputParser()
     return chain.invoke({"question": question, "answer": answer}).strip().lower()
+
+def rewrite_query_with_feedback(original_question, current_rewrite, feedback, llm):
+    """
+    根据用户提供的反馈（feedback），对当前的重写结果（current_rewrite）进行再次优化。
+    """
+    template = """You are an AI assistant helping a researcher refine their search query for an XFEL database.
+    
+    Original User Intent: {original_question}
+    Current Rewritten Version: {current_rewrite}
+    User Feedback: {feedback}
+    
+    Task: Based on the feedback, provide an improved version of the rewritten query. 
+    Focus on technical precision and XFEL terminology.
+    Return ONLY the new rewritten question, no explanation.
+
+    New Rewritten Question:"""
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+    
+    new_rewrite = chain.invoke({
+        "original_question": original_question,
+        "current_rewrite": current_rewrite,
+        "feedback": feedback
+    })
+    return new_rewrite.strip()
